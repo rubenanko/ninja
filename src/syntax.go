@@ -8,14 +8,17 @@ import (
 
 // SGR color codes (256-color palette). Swap these to restyle the editor.
 const (
-	colDefault = "39"
-	colKeyword = "38;5;141" // purple
-	colType    = "38;5;81"  // blue
-	colBuiltin = "38;5;117" // light blue
-	colFunc    = "38;5;215" // orange
-	colString  = "38;5;114" // green
-	colComment = "38;5;245" // gray
-	colNumber  = "38;5;180" // tan
+	colDefault   = "39"
+	colKeyword   = "38;5;141"         // purple
+	colType      = "38;5;81"          // blue
+	colBuiltin   = "38;5;117"         // light blue
+	colFunc      = "38;5;215"         // orange
+	colString    = "38;5;114"         // green
+	colComment   = "38;5;245"         // gray
+	colNumber    = "38;5;180"         // tan
+	colMark      = "38;5;196"         // red: last cursor position on a line
+	colSearch    = "48;5;220;38;5;16" // yellow bg, black fg: search occurrence
+	colSearchSel = "48;5;202;38;5;16" // orange bg, black fg: selected occurrence
 )
 
 // lang holds the keyword tables for one language. Add a language by adding

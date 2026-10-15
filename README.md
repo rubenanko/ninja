@@ -16,12 +16,28 @@ on Linux and macOS.
   - Auto-indent on Enter (keeps leading whitespace, adds a level after
     `{`, `[`, `(`)
   - Smart dedent when typing `}` on an otherwise-empty line
-  - `Ctrl+←` / `Ctrl+→` (and `Alt+←/→`, `Alt+b/f`) jump between words
+  - `Ctrl+←` / `Ctrl+→` (and `Alt+b/f`) jump between words; `Alt+←` / `Alt+→`
+    jump to the next/previous non-alphanumeric, non-space character
+    (punctuation and symbols), without leaving the line
+  - `Ctrl+Shift+{char}` … ninja jump mode: press `Ctrl+P` (the footer turns
+    red), then one character — the cursor jumps to the nearest line whose
+    remembered last position character equals it (Esc cancels)
   - `Ctrl+\` deletes a whole word (the word at the cursor, or the next one)
   - `Ctrl+Backspace` deletes the word before the cursor
   - `Ctrl+U` / `Ctrl+K` delete to start / end of line
-  - First visit to a line (via up/down arrows) lands at the end of that line
-    instead of keeping the previous column; later visits keep the column
+  - First visit to a line (via up/down arrows) lands at the end of that line;
+    if the line is longer than the screen it lands on the last visible
+    character instead, so the view never scrolls horizontally; returning to a
+    line you've already been on goes back to the position you last had there
+  - Each line remembers the last cursor position, shown as a red marker once
+    you leave the line (a red `<` marks the spot when it was a space)
+- Backspace vs Ctrl+Backspace are auto-detected from the terminal's erase
+  byte, so both the `0x7f` (xterm) and `0x08` (^H) conventions work
+- String search mode (`Ctrl+/`, also accepted as `Ctrl+Shift+/` and as the
+  raw byte `0x0f` that ASCII&0x1f-style terminals send): type to filter,
+  `Ctrl+N` / `Ctrl+P` cycle the next/previous occurrence, Enter jumps to the
+  selected one, Esc exits. All occurrences are highlighted (orange = selected)
+  while searching
 - Line numbers, cursor-line highlight, selection highlight, status bar with
   messages and shortcut hints
 - Open / save / save-as with an inline filename prompt (`Ctrl+O`, `Ctrl+S`)
@@ -52,12 +68,15 @@ python3 smoke.py            # end-to-end pty smoke test (needs python3 + build/t
 | --- | --- |
 | `Ctrl+Q` | Quit (press twice to discard unsaved changes) |
 | `Ctrl+S` | Save (prompts for a name if none) |
-| `Ctrl+O` | Open a file (prompt) |
+| `Ctrl+O` (or `Alt+O`) | Open a file (prompt). On terminals that encode Ctrl+`/` as byte 0x0f, that byte is Ctrl+`/` now, so use `Alt+O` or CSI-u Ctrl+O |
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste |
 | `Ctrl+A` | Select all |
 | `Shift+← ↑ ↓ →` | Extend selection |
-| `Ctrl+←` / `Ctrl+→` (or `Alt+←/→`, `Alt+b/f`) | Jump word by word |
+| `Ctrl+←` / `Ctrl+→` (or `Alt+b/f`) | Jump word by word |
+| `Alt+←` / `Alt+→` | Jump to next/previous punctuation/symbol (spaces skipped) |
+| `Ctrl+P` | Ninja jump mode: press a character to jump to the nearest line whose last position char matches (footer turns red) |
+| `Ctrl+/` (or `Ctrl+Shift+/`) | Search mode (`Ctrl+N`/`Ctrl+P` next/prev, Enter jump, Esc exit) — works for every common encoding of the key |
 | `Ctrl+\` | Delete a whole word |
 | `Ctrl+Backspace` (or `Alt+Backspace`) | Delete the word before the cursor |
 | `Ctrl+U` / `Ctrl+K` | Delete to line start / end |

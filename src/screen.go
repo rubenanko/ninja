@@ -18,6 +18,7 @@ func enterRaw() (func(), error) {
 		return nil, fmt.Errorf("get termios: %w", err)
 	}
 	orig := *t
+	eraseByte = orig.Cc[syscall.VERASE] // byte the Backspace key sends
 	makeRaw(t)
 	if err := setTermios(fd, t); err != nil {
 		return nil, fmt.Errorf("set termios: %w", err)
@@ -100,16 +101,12 @@ func (e *Editor) render() {
 		vh = 1
 	}
 
-	gw := 3
-	if digits := len(strconv.Itoa(e.buf.NumLines())); digits > gw {
-		gw = digits
-	}
-	textW := w - gw - 1
-	if textW < 1 {
-		textW = 1
-	}
+	gw := e.gutterWidth()
+	textW := e.textWidth()
 
 	e.scrollToCursor(textW, vh)
+
+	e.rememberCursor()
 
 	if e.hlDirty >= 0 {
 		e.recomputeHLStates()
@@ -149,6 +146,9 @@ func (e *Editor) render() {
 	if e.prompt != nil {
 		curRow = h
 		curCol = len(e.prompt.label) + len(string(e.prompt.input)) + 1
+	} else if e.search.active {
+		curRow = h
+		curCol = len("search: ") + len(string(e.search.query)) + 1
 	}
 	if curRow < 1 {
 		curRow = 1
@@ -236,6 +236,21 @@ func (e *Editor) selRange() (pos, pos) {
 	return e.selStartEnd()
 }
 
+// rememberCursor records the cursor's current column for its line, so the
+// last position on each line can be shown with a red marker once the cursor
+// leaves it.
+func (e *Editor) rememberCursor() {
+	if e.cur.row >= len(e.lastCol) {
+		g := make([]int, e.buf.NumLines())
+		for i := range g {
+			g[i] = -1
+		}
+		copy(g, e.lastCol)
+		e.lastCol = g
+	}
+	e.lastCol[e.cur.row] = e.cur.col
+}
+
 func (e *Editor) renderLine(sb *strings.Builder, ln, textW int, selStart, selEnd pos) {
 	line := e.buf.Line(ln)
 	colors, _ := e.hlLine(ln)
@@ -257,13 +272,48 @@ func (e *Editor) renderLine(sb *strings.Builder, ln, textW int, selStart, selEnd
 	i := runeContainingCol(line, e.left)
 	col := e.left
 	curLine := ln == e.cur.row && e.prompt == nil
+	// Red marker for the last cursor position on this line (not shown while
+	// the cursor is on the line itself).
+	markCol := -1
+	if !curLine && ln < len(e.lastCol) {
+		markCol = e.lastCol[ln]
+		if markCol < 0 || markCol >= len(line) {
+			markCol = -1
+		}
+	}
 	curStyle := ""
+	// Search matches on this line (highlighted while search mode is active).
+	var rowMatches []match
+	var selMatch match
+	if e.search.active && ln < len(e.search.byRow) {
+		rowMatches = e.search.byRow[ln]
+		if e.search.sel >= 0 && e.search.sel < len(e.search.matches) {
+			selMatch = e.search.matches[e.search.sel]
+		}
+	}
 	for i < len(line) && col < limit {
 		style := colors[i]
-		if i >= selA && i < selB {
-			style += ";48;5;239"
-		} else if curLine {
-			style += ";48;5;236"
+		inMatch, isSel := false, false
+		for _, m := range rowMatches {
+			if i >= m.col && i < m.end {
+				inMatch = true
+				isSel = m == selMatch
+				break
+			}
+		}
+		switch {
+		case inMatch && isSel:
+			style = colSearchSel
+		case inMatch:
+			style = colSearch
+		case i == markCol:
+			style = colMark
+		default:
+			if i >= selA && i < selB {
+				style += ";48;5;239"
+			} else if curLine {
+				style += ";48;5;236"
+			}
 		}
 		if style != curStyle {
 			sb.WriteString("\x1b[" + style + "m")
@@ -273,10 +323,19 @@ func (e *Editor) renderLine(sb *strings.Builder, ln, textW int, selStart, selEnd
 			// Expand the tab into spaces, clipped to the visible window.
 			tabStart := displayCol(line, i)
 			tabEnd := tabStart + (tabWidth - tabStart%tabWidth)
+			if i == markCol {
+				// A tab can't be seen, so mark its first cell with '<'.
+				sb.WriteByte('<')
+				col++
+			}
 			for col < tabEnd && col < limit {
 				sb.WriteByte(' ')
 				col++
 			}
+		} else if i == markCol && line[i] == ' ' {
+			// A space can't be seen either; show a red '<' instead.
+			sb.WriteByte('<')
+			col++
 		} else {
 			sb.WriteRune(line[i])
 			col++
@@ -290,19 +349,27 @@ func (e *Editor) renderStatus(sb *strings.Builder, w int) {
 	if left == "" {
 		left = "[no file]"
 	}
-	if e.prompt != nil {
+	right := ""
+	switch {
+	case e.prompt != nil:
 		left = e.prompt.label + string(e.prompt.input)
-	} else {
+	case e.search.active:
+		left = "search: " + string(e.search.query)
+		if len(e.search.matches) > 0 {
+			right = fmt.Sprintf(" %d/%d  ^N next ^P prev Enter jump Esc exit", e.search.sel+1, len(e.search.matches))
+		} else {
+			right = " no match  ^N/^P next/prev Enter jump Esc exit"
+		}
+	case e.ninja:
+		left = "ninja jump: press the target character (Esc cancels)"
+	default:
 		if e.modified {
 			left += " *"
 		}
-	}
-	right := ""
-	if e.prompt == nil {
 		right = fmt.Sprintf(" %d:%d  ^S save ^Z undo ^Y redo ^X cut ^C copy ^V paste ^Q quit",
 			e.cur.row+1, e.cur.col+1)
 	}
-	if e.message != "" && time.Now().Before(e.msgUntil) {
+	if e.message != "" && time.Now().Before(e.msgUntil) && e.prompt == nil && !e.search.active && !e.ninja {
 		left += "  |  " + e.message
 	}
 	// Trim so the right-aligned hints still fit.
@@ -313,7 +380,11 @@ func (e *Editor) renderStatus(sb *strings.Builder, w int) {
 	if len(left) > maxLeft {
 		left = left[:maxLeft]
 	}
-	sb.WriteString("\x1b[7m") // inverse video
+	if e.ninja {
+		sb.WriteString("\x1b[48;5;196;38;5;15m") // red footer: ninja jump mode is on
+	} else {
+		sb.WriteString("\x1b[7m") // inverse video
+	}
 	sb.WriteString(left)
 	if pad := w - len(left) - len(right); pad > 0 {
 		for i := 0; i < pad; i++ {

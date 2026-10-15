@@ -108,18 +108,45 @@ func (p *keyParser) next() (key, bool) {
 	}
 }
 
+// eraseByte is the byte the terminal's plain Backspace key sends, captured
+// from termios VERASE before raw mode. Terminals disagree: some send 0x7f
+// for Backspace and 0x08 for Ctrl+Backspace, others do the opposite.
+var eraseByte byte
+
+// backspaceKey disambiguates plain vs Ctrl+Backspace using the terminal's
+// own erase byte: the erase byte is plain Backspace, the other of {0x08,
+// 0x7f} is Ctrl+Backspace. With an unknown erase byte it falls back to the
+// xterm convention (0x7f = Backspace).
+func backspaceKey(b byte) key {
+	switch {
+	case eraseByte == b:
+		return kCode(codeBackspace, modNone)
+	case eraseByte == 0x08 || eraseByte == 0x7f:
+		return kCode(codeBackspace, modCtrl)
+	case b == 0x7f:
+		return kCode(codeBackspace, modNone)
+	default:
+		return kCode(codeBackspace, modCtrl)
+	}
+}
+
 func (p *keyParser) parseLead(b byte) key {
 	switch {
 	case b == 0x0d || b == 0x0a:
 		return kRune('\n', modNone) // Enter
 	case b == 0x09:
 		return kRune('\t', modNone) // Tab
-	case b == 0x7f:
-		return kCode(codeBackspace, modNone) // Backspace
-	case b == 0x08:
-		return kCode(codeBackspace, modCtrl) // Ctrl+Backspace (xterm convention)
+	case b == 0x08 || b == 0x7f:
+		return backspaceKey(b)
 	case b == 0x1c:
 		return kRune('\\', modCtrl) // Ctrl+\
+	case b == 0x1f:
+		return kRune('/', modCtrl) // Ctrl+/ (xterm sends 0x1f for it)
+	case b == 0x0f:
+		// Ctrl+/ on terminals that compute control codes as ASCII & 0x1f
+		// (0x2f & 0x1f = 0x0f). This is the same byte as Ctrl+O, which is
+		// still reachable via CSI-u/modifyOtherKeys or Alt+O.
+		return kRune('/', modCtrl)
 	case b >= 1 && b <= 26:
 		return kRune(rune('a'-1+b), modCtrl)
 	case b >= 0x20 && b < 0x7f:
@@ -234,11 +261,19 @@ func (p *keyParser) parseCSI() key {
 			return kCode(codePageUp, m)
 		case 6:
 			return kCode(codePageDown, m)
+		case 27:
+			// modifyOtherKeys (xterm): ESC [ 27 ; <mods> ; <code> ~
+			if len(params) >= 3 && params[2] >= 32 && params[2] <= 126 {
+				return kRune(rune(params[2]), m)
+			}
 		}
 	case 'u':
 		// CSI-u (kitty protocol): ESC [ <code> ; <mods> u
 		if params[0] == 8 || params[0] == 127 {
 			return kCode(codeBackspace, m)
+		}
+		if params[0] >= 32 && params[0] <= 126 {
+			return kRune(rune(params[0]), m) // e.g. Ctrl+Shift+x
 		}
 	}
 	return kRune(0x1b, modNone)

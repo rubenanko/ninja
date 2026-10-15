@@ -31,6 +31,20 @@ type prompt struct {
 	done  func(string)
 }
 
+// match is one occurrence of the search string in the buffer.
+type match struct {
+	row, col, end int // [col, end) rune range on line row
+}
+
+// searchState is the string-search mode (Ctrl+/).
+type searchState struct {
+	active  bool
+	query   []rune
+	matches []match   // all matches, in order
+	byRow   [][]match // per-line lookup for rendering
+	sel     int       // index into matches (-1 = none)
+}
+
 type Editor struct {
 	buf       *Buffer
 	cur       pos
@@ -52,6 +66,9 @@ type Editor struct {
 	states    []bool // block-comment state at the start of each line
 	hlDirty   int    // first line whose highlight state is stale, -1 = clean
 	visited   []bool // lines the cursor has already been on
+	lastCol   []int  // per-line last cursor column (-1 = none), shown as red marker
+	search    searchState
+	ninja     bool // ninja jump mode: next character jumps to its last-position line
 	quit      bool
 	quitArm   bool
 }
@@ -63,6 +80,7 @@ func NewEditor() *Editor {
 		keys:    newKeyParser(),
 		hlDirty: -1,
 		visited: []bool{true}, // cursor starts on line 0
+		lastCol: []int{-1},
 	}
 }
 
@@ -110,6 +128,7 @@ func (e *Editor) loadContent(data []byte) {
 	e.sel, e.top, e.left = nil, 0, 0
 	e.cur, e.desired = pos{0, 0}, 0
 	e.visited = []bool{true} // cursor starts on line 0
+	e.lastCol = []int{-1}
 	e.modified = false
 	e.hlDirty = 0
 }
@@ -319,16 +338,66 @@ func (e *Editor) visitLine(r int) bool {
 	return was
 }
 
+// lineLastCol returns the remembered cursor column for line r, or -1 if the
+// line has no memory yet (never visited, or the array is stale).
+func (e *Editor) lineLastCol(r int) int {
+	if r < 0 || r >= len(e.lastCol) {
+		return -1
+	}
+	return e.lastCol[r]
+}
+
+// gutterWidth returns the width of the line-number gutter.
+func (e *Editor) gutterWidth() int {
+	gw := 3
+	if digits := len(strconv.Itoa(e.buf.NumLines())); digits > gw {
+		gw = digits
+	}
+	return gw
+}
+
+// textWidth returns the number of text columns visible on screen. With an
+// unknown terminal size it returns a huge value so nothing is treated as
+// off-screen.
+func (e *Editor) textWidth() int {
+	if e.w <= 0 {
+		return 1 << 30
+	}
+	tw := e.w - e.gutterWidth() - 1
+	if tw < 1 {
+		tw = 1
+	}
+	return tw
+}
+
+// firstVisitCol returns where to land when entering line r for the first
+// time: the end of the line when it fits on screen, otherwise the last
+// currently visible character, so long lines don't scroll horizontally.
+func (e *Editor) firstVisitCol(r int) int {
+	line := e.buf.Line(r)
+	end := len(line)
+	if e.left+e.textWidth() > displayCol(line, end) {
+		return end
+	}
+	// The end of the line is off-screen: land on the last visible character.
+	return runeContainingCol(line, e.left+e.textWidth()-1)
+}
+
 func (e *Editor) moveUp(extend bool) {
 	r, c := e.cur.row, e.cur.col
 	if r > 0 {
 		r--
-		c = e.desired
+		if e.visitLine(r) {
+			// Already visited: return to the position remembered on this line.
+			c = e.lineLastCol(r)
+			if c < 0 {
+				c = e.desired
+			}
+		} else {
+			c = e.firstVisitCol(r) // first time on this line
+		}
 		if l := e.buf.LineLen(r); c > l {
 			c = l
-		}
-		if !e.visitLine(r) {
-			c = e.buf.LineLen(r) // first time on this line: land at its end
 		}
 	} else {
 		c = 0
@@ -340,12 +409,17 @@ func (e *Editor) moveDown(extend bool) {
 	r, c := e.cur.row, e.cur.col
 	if r+1 < e.buf.NumLines() {
 		r++
-		c = e.desired
+		if e.visitLine(r) {
+			// Already visited: return to the position remembered on this line.
+			c = e.lineLastCol(r)
+			if c < 0 {
+				c = e.desired
+			}
+		} else {
+			c = e.firstVisitCol(r) // first time on this line
+		}
 		if l := e.buf.LineLen(r); c > l {
 			c = l
-		}
-		if !e.visitLine(r) {
-			c = e.buf.LineLen(r) // first time on this line: land at its end
 		}
 	}
 	e.goPos(r, c, extend)
@@ -424,6 +498,47 @@ func (e *Editor) wordRight(extend bool) {
 		}
 		r++
 		c = 0
+	}
+	e.goPos(r, c, extend)
+}
+
+func isAlnum(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r)
+}
+
+// isPunct reports whether r is a jump target for Alt+arrows: a non-alnum
+// character that is not whitespace (spaces, tabs) and not a line boundary.
+func isPunct(r rune) bool {
+	if unicode.IsLetter(r) || unicode.IsDigit(r) {
+		return false
+	}
+	return r != ' ' && r != '\t'
+}
+
+// punctRight moves the cursor to the next punctuation/symbol character on
+// the current line, skipping spaces. Stays put if there is none.
+func (e *Editor) punctRight(extend bool) {
+	r, c := e.cur.row, e.cur.col
+	line := e.buf.Line(r)
+	for j := c + 1; j < len(line); j++ {
+		if isPunct(line[j]) {
+			e.goPos(r, j, extend)
+			return
+		}
+	}
+	e.goPos(r, c, extend)
+}
+
+// punctLeft moves the cursor to the previous punctuation/symbol character on
+// the current line, skipping spaces. Stays put if there is none.
+func (e *Editor) punctLeft(extend bool) {
+	r, c := e.cur.row, e.cur.col
+	line := e.buf.Line(r)
+	for j := c - 1; j >= 0; j-- {
+		if isPunct(line[j]) {
+			e.goPos(r, j, extend)
+			return
+		}
 	}
 	e.goPos(r, c, extend)
 }
@@ -664,6 +779,9 @@ func (e *Editor) actArrowRight(k key) {
 func (e *Editor) actWordLeft(k key)  { e.wordLeft(k.mods&modShift != 0) }
 func (e *Editor) actWordRight(k key) { e.wordRight(k.mods&modShift != 0) }
 
+func (e *Editor) actPunctLeft(k key)  { e.punctLeft(k.mods&modShift != 0) }
+func (e *Editor) actPunctRight(k key) { e.punctRight(k.mods&modShift != 0) }
+
 func (e *Editor) actHome(k key) {
 	if k.mods&modCtrl != 0 {
 		e.goPos(0, 0, false)
@@ -766,6 +884,7 @@ var keymap = []binding{
 	{kRune('q', modCtrl), "quit", (*Editor).actQuit},
 	{kRune('s', modCtrl), "save", (*Editor).actSave},
 	{kRune('o', modCtrl), "open", (*Editor).actOpen},
+	{kRune('o', modAlt), "open", (*Editor).actOpen}, // fallback: 0x0f is Ctrl+/ now
 	// edit
 	{kRune('z', modCtrl), "undo", (*Editor).actUndo},
 	{kRune('y', modCtrl), "redo", (*Editor).actRedo},
@@ -773,6 +892,9 @@ var keymap = []binding{
 	{kRune('x', modCtrl), "cut", (*Editor).actCut},
 	{kRune('v', modCtrl), "paste", (*Editor).actPaste},
 	{kRune('a', modCtrl), "select-all", (*Editor).actSelectAll},
+	{kRune('p', modCtrl), "ninja-jump", (*Editor).actNinja},
+	{kRune('/', modCtrl), "search", (*Editor).actSearch},
+	{kRune('/', modCtrl|modShift), "search", (*Editor).actSearch}, // some keyboards need Shift for '/'
 	{kRune('\\', modCtrl), "delete-word", (*Editor).actDeleteWord},
 	{kRune('u', modCtrl), "delete-to-bol", (*Editor).actDeleteToBOL},
 	{kRune('k', modCtrl), "delete-to-eol", (*Editor).actDeleteToEOL},
@@ -802,8 +924,10 @@ var keymap = []binding{
 	{kCode(codeArrowRight, modCtrl), "word-right", (*Editor).actWordRight},
 	{kCode(codeArrowLeft, modCtrl|modShift), "select-word-left", (*Editor).actWordLeft},
 	{kCode(codeArrowRight, modCtrl|modShift), "select-word-right", (*Editor).actWordRight},
-	{kCode(codeArrowLeft, modAlt), "word-left", (*Editor).actWordLeft},
-	{kCode(codeArrowRight, modAlt), "word-right", (*Editor).actWordRight},
+	{kCode(codeArrowLeft, modAlt), "punct-left", (*Editor).actPunctLeft},
+	{kCode(codeArrowRight, modAlt), "punct-right", (*Editor).actPunctRight},
+	{kCode(codeArrowLeft, modAlt|modShift), "select-punct-left", (*Editor).actPunctLeft},
+	{kCode(codeArrowRight, modAlt|modShift), "select-punct-right", (*Editor).actPunctRight},
 	{kRune('b', modAlt), "word-left", (*Editor).actWordLeft},
 	{kRune('f', modAlt), "word-right", (*Editor).actWordRight},
 	{kCode(codeHome, modNone), "home", (*Editor).actHome},
@@ -859,6 +983,192 @@ func (e *Editor) handlePrompt(k key) {
 }
 
 // ---------------------------------------------------------------------------
+// Search mode (Ctrl+/)
+// ---------------------------------------------------------------------------
+
+func (e *Editor) actSearch(_ key) {
+	e.search.active = true
+	e.search.query = nil
+	e.recomputeSearch()
+	e.setMessage("search: type to filter, ^N/^P next/prev, Enter jump, Esc exit")
+}
+
+// recomputeSearch rescans the buffer for the current query and re-selects the
+// occurrence closest to the cursor.
+func (e *Editor) recomputeSearch() {
+	s := &e.search
+	s.matches = nil
+	s.byRow = nil
+	s.sel = -1
+	q := s.query
+	if len(q) == 0 {
+		return
+	}
+	for r := 0; r < e.buf.NumLines(); r++ {
+		line := e.buf.Line(r)
+		for c := 0; c+len(q) <= len(line); c++ {
+			ok := true
+			for j := 0; j < len(q); j++ {
+				if line[c+j] != q[j] {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				s.matches = append(s.matches, match{r, c, c + len(q)})
+			}
+		}
+	}
+	s.byRow = make([][]match, e.buf.NumLines())
+	for _, m := range s.matches {
+		s.byRow[m.row] = append(s.byRow[m.row], m)
+	}
+	for i, m := range s.matches {
+		if m.row >= e.cur.row {
+			s.sel = i
+			break
+		}
+	}
+	if s.sel < 0 && len(s.matches) > 0 {
+		s.sel = 0
+	}
+}
+
+// scrollToMatch brings the selected occurrence into view.
+func (e *Editor) scrollToMatch(idx int) {
+	if idx < 0 || idx >= len(e.search.matches) {
+		return
+	}
+	m := e.search.matches[idx]
+	vh := e.h - 1
+	if vh < 1 {
+		vh = 1
+	}
+	if m.row < e.top {
+		e.top = m.row
+	}
+	if m.row >= e.top+vh {
+		e.top = m.row - vh + 1
+	}
+	if e.top < 0 {
+		e.top = 0
+	}
+	col := displayCol(e.buf.Line(m.row), m.col)
+	if col < e.left {
+		e.left = col
+	}
+	if col >= e.left+e.textWidth() {
+		e.left = col - e.textWidth() + 1
+	}
+	if e.left < 0 {
+		e.left = 0
+	}
+}
+
+func (e *Editor) handleSearch(k key) {
+	s := &e.search
+	switch {
+	case k == kRune(0x1b, modNone): // Esc: exit, keep cursor
+		s.active = false
+	case k == kRune('\n', modNone): // Enter: jump to the selected occurrence
+		if s.sel >= 0 && s.sel < len(s.matches) {
+			m := s.matches[s.sel]
+			e.goPos(m.row, m.col, false)
+		}
+		s.active = false
+	case k == kRune('n', modCtrl):
+		if len(s.matches) > 0 {
+			s.sel = (s.sel + 1) % len(s.matches)
+			e.scrollToMatch(s.sel)
+		}
+	case k == kRune('p', modCtrl):
+		if len(s.matches) > 0 {
+			s.sel = (s.sel - 1 + len(s.matches)) % len(s.matches)
+			e.scrollToMatch(s.sel)
+		}
+	case k.code == codeBackspace:
+		if len(s.query) > 0 {
+			s.query = s.query[:len(s.query)-1]
+			e.recomputeSearch()
+		}
+	case k.mods == modCtrl && k.r == 'u':
+		s.query = nil
+		e.recomputeSearch()
+	case k.mods == modNone && k.r != 0:
+		s.query = append(s.query, k.r)
+		e.recomputeSearch()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Ninja jump mode (Ctrl+P, then press the target character)
+// ---------------------------------------------------------------------------
+
+// lastColChar returns the character at line r's remembered position, or 0 if
+// there is none (never visited, or the position is past the end).
+func (e *Editor) lastColChar(r int) rune {
+	c := e.lineLastCol(r)
+	if c < 0 {
+		return 0
+	}
+	line := e.buf.Line(r)
+	if c >= len(line) {
+		return 0
+	}
+	return line[c]
+}
+
+func (e *Editor) jumpToLastCol(r int) {
+	e.goPos(r, e.lineLastCol(r), false)
+}
+
+// jumpToChar jumps to the line closest to the cursor whose remembered last
+// position character equals ch. The current line is considered only when the
+// cursor is not already on its remembered spot.
+func (e *Editor) jumpToChar(ch rune) {
+	if ch == 0 {
+		return
+	}
+	if c := e.lineLastCol(e.cur.row); c >= 0 && c < e.buf.LineLen(e.cur.row) &&
+		e.buf.Line(e.cur.row)[c] == ch && e.cur.col != c {
+		e.jumpToLastCol(e.cur.row)
+		return
+	}
+	for d := 1; ; d++ {
+		up, down := e.cur.row-d, e.cur.row+d
+		if up >= 0 && e.lastColChar(up) == ch {
+			e.jumpToLastCol(up)
+			return
+		}
+		if down < e.buf.NumLines() && e.lastColChar(down) == ch {
+			e.jumpToLastCol(down)
+			return
+		}
+		if up < 0 && down >= e.buf.NumLines() {
+			break
+		}
+	}
+	e.setMessage("no line with '" + string(ch) + "' at its last position")
+}
+
+// actNinja enters ninja jump mode: the next character pressed jumps to the
+// nearest line whose last position character equals it.
+func (e *Editor) actNinja(_ key) {
+	e.ninja = true
+	e.setMessage("ninja jump: press the target character (Esc cancels)")
+}
+
+func (e *Editor) handleNinja(k key) {
+	switch {
+	case k == kRune(0x1b, modNone): // Esc: cancel
+		e.ninja = false
+	case k.mods == modNone && k.r != 0 && k.code == codeNone:
+		e.jumpToChar(k.r)
+		e.ninja = false
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
 
@@ -877,6 +1187,10 @@ func (e *Editor) run() error {
 		}
 		if e.prompt != nil {
 			e.handlePrompt(k)
+		} else if e.search.active {
+			e.handleSearch(k)
+		} else if e.ninja {
+			e.handleNinja(k)
 		} else {
 			e.handle(k)
 		}

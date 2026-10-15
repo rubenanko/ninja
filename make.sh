@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
-# Build tinyedit into ./build
+
 set -euo pipefail
+
 cd "$(dirname "$0")"
-mkdir -p build
+
+if [ -d build]; then
+	rm -Rf build
+fi
+
+mkdir build
+
+echo "built build/ninja"
 (cd src && go build -o ../build/tinyedit .)
-echo "built build/tinyedit"
+
